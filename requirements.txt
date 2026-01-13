@@ -5,5 +5,4 @@ stable-baselines3
 ta 
 shimmy
 yfinance
-torch
-numpy
+
