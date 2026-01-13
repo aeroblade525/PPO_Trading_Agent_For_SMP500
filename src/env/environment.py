@@ -1,10 +1,6 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-import pandas as pd
-import yfinance as yf
-from ta.trend import SMAIndicator, MACD
-from ta.momentum import RSIIndicator
 
 class SP500TradingEnv(gym.Env):
   metadata = {"render_modes":["human"]}
