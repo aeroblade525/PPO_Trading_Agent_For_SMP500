@@ -4,9 +4,8 @@ import sqlite3
 from pathlib import Path
 
 
-# =========================
 # CONFIG
-# =========================
+
 DB_PATH = "src/data/sp500.sqlite"   # use .sqlite if you want
 START_DATE = "2023-01-01"
 END_DATE = "2024-01-01"
@@ -15,9 +14,7 @@ BLACKLIST = {"GEV", "KVUE", "SOLV", "VLTO", "WBA"}
 TICKER_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
 
 
-# =========================
 # SQLITE INIT
-# =========================
 def init_sqlite_db(db_path: str):
     """
     Initialize SQLite database and schema.
