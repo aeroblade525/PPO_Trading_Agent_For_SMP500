@@ -13,7 +13,7 @@ class SP500TradingEnv(gym.Env):
     
     self.action_space = spaces.Discrete(3)
 
-    self.observation_space = spaces.box(
+    self.observation_space = spaces.Box(
       low=-np.inf, high = np.inf, shape = (8,), dtype=np.float32     #prob will change in future
     )
 

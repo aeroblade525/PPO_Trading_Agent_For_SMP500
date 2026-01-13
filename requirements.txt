@@ -7,3 +7,5 @@ shimmy
 yfinance
 lxml
 fastparquet
+torch
+numpy
