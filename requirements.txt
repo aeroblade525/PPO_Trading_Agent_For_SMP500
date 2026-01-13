@@ -1,0 +1,7 @@
+gymnasium
+numpy
+pandas
+stable-baselines3
+ta 
+shimmy
+yfinance
