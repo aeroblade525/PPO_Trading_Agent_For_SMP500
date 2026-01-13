@@ -2,3 +2,4 @@ todo.txt
 *.png
 *.pth
 *.idea
+clean.py
