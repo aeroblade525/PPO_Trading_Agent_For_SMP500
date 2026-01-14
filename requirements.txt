@@ -1,5 +1,4 @@
 gymnasium
-numpy
 pandas
 stable-baselines3
 ta 
@@ -9,3 +8,4 @@ lxml
 fastparquet
 torch
 numpy
+sqlite

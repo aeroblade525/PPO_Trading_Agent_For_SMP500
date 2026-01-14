@@ -5,3 +5,4 @@ todo.txt
 clean.py
 *.png
 *.sqlite
+__pychache__

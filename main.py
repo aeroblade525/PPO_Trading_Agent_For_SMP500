@@ -13,7 +13,7 @@ from src.ppo.utils import plot_learning_curve
 def make_test_df(ticker):
     # 1) Download AAPL daily data for the past 2 years
     df = yf.download(
-        "TSLA",
+        ticker,
         period="2y",
         interval="1d",
         auto_adjust=False,
@@ -65,7 +65,9 @@ class SimpleNormalizeWrapper(gym.Wrapper):
         obs = np.array(obs, dtype=np.float32)
         obs[0:4] /= 1000.0  # Scale Prices
         obs[4] /= 100.0     # Scale RSI
+        obs[5] /= 20.0      # Scale MACD (Approx range -20 to 20 for high priced stocks)
         obs[6] /= 10000.0   # Scale Balance
+        obs[7] /= 100.0     # Scale Shares (Assuming max shares < 100 for start)
         return obs
 
     def reset(self, **kwargs):
