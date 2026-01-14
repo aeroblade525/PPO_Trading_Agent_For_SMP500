@@ -4,6 +4,7 @@ import gymnasium as gym
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 import yfinance as yf
+import time
 # --- Imports from your project structure ---
 from src.env.environment import SP500TradingEnv  # Corrected import name
 from src.ppo.PPO_Classes import Agent
@@ -141,6 +142,11 @@ for i in range(n_games):
             learn_iters += 1
 
         observation = observation_
+
+    start_time = time.time()
+    action, prob, val = agent.choose_action(observation)
+    # ... env.step ...
+    print(f"Step time: {time.time() - start_time:.4f}s")
 
     score_history.append(score)
     price_history.append(info)
