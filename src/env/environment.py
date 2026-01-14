@@ -2,158 +2,133 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-class SP500TradingEnv(gym.Env):
+class MultiStockTradingEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, df, initial_balance=100000):
-        super(SP500TradingEnv, self).__init__()
-
-        self.df = df
+    def __init__(self, data_tensor, initial_balance=100000, n_stocks=100):
+        super(MultiStockTradingEnv, self).__init__()
+        
+        # Data Structure: 
+        # numpy array of shape (n_timesteps, n_stocks, n_features)
+        # Features usually: [Open, High, Low, Close, RSI, MACD]
+        self.data = data_tensor
+        self.n_stocks = n_stocks
+        self.n_features = data_tensor.shape[2]
         self.initial_balance = initial_balance
         
-        # Action Space: 0 = Hold, 1 = Buy, 2 = Sell
-        self.action_space = spaces.Discrete(3)
-
-        # Observation Space: [Open, High, Low, Close, RSI, MACD, Balance, Shares]
-        # We use float32 to match PPO expectations
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32
+        # --- ACTION SPACE ---
+        # A vector of 100 continuous numbers between -1 and 1
+        # Positive = Buy weight, Negative = Sell percentage
+        self.action_space = spaces.Box(
+            low=-1, high=1, shape=(self.n_stocks,), dtype=np.float32
         )
 
-        # DSR Hyperparameters
-        self.eta = 1 / 252  # Decay rate for DSR (approx 1 year window)
-        
-        # Initialize internal variables
+        # --- OBSERVATION SPACE ---
+        # We see: (Market Data for 100 stocks) + (Shares Held for 100 stocks) + (Cash Balance)
+        # Size = (100 * 6 features) + (100 share counts) + 1 balance
+        obs_size = (self.n_stocks * self.n_features) + self.n_stocks + 1
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
+        )
+
+        # Internal State
         self.balance = self.initial_balance
-        self.shares_held = 0
+        self.shares_held = np.zeros(self.n_stocks, dtype=np.float32)
         self.current_step = 0
+        
+        # DSR Variables
+        self.eta = 1 / 252
         self.A = 0.0
         self.B = 0.0
         self.prev_net_worth = self.initial_balance
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        
         self.balance = self.initial_balance
-        self.shares_held = 0
+        self.shares_held = np.zeros(self.n_stocks, dtype=np.float32)
         self.current_step = 0
-        
-        # Reset DSR moving averages
+        self.prev_net_worth = self.initial_balance
         self.A = 0.0
         self.B = 0.0
-        self.prev_net_worth = self.initial_balance
         
-        obs = self._next_observation()
-        info = {}
-        return obs, info
+        return self._next_observation(), {}
 
-    def step(self, action):
-        # 1. Execute Action at CURRENT Price
-        current_price = self.df.iloc[self.current_step]["Close"]
-        self._take_action(action, current_price)
+    def step(self, actions):
+        # 1. Get Current Prices for all 100 stocks
+        # Assuming 'Close' is at index 3 in our features
+        current_prices = self.data[self.current_step, :, 3] 
         
-        # 2. Move to NEXT Day
+        # 2. Execute Trades
+        self._take_action(actions, current_prices)
+        
+        # 3. Move Time Forward
         self.current_step += 1
         
-        # 3. Check for Termination (End of Data)
-        # We stop at len-1 because we need 'tomorrow's' price for reward calc
-        if self.current_step >= len(self.df):
-            return np.zeros(8, dtype=np.float32), 0, True, False, {"net_worth": self.prev_net_worth}
+        # 4. Check Termination
+        if self.current_step >= len(self.data) - 1:
+            return np.zeros(self.observation_space.shape), 0, True, False, {"net_worth": self.prev_net_worth}
 
-        # 4. Calculate Net Worth using NEW Price
-        next_price = self.df.iloc[self.current_step]["Close"]
-        current_val = self.balance + (self.shares_held * next_price)
+        # 5. Calculate Portfolio Value
+        # Next Step Prices (to calculate immediate PnL)
+        next_prices = self.data[self.current_step, :, 3]
         
-        # 5. Bankruptcy Check
-        bankrupt = current_val <= 0
-        terminated = bankrupt
-
-        # 6. Calculate Reward (Differential Sharpe Ratio)
-        reward = self._calculate_dsr(current_val, self.prev_net_worth)
+        # Vectorized Value Calculation: Cash + (Vector of Shares * Vector of Prices)
+        stock_value = np.sum(self.shares_held * next_prices)
+        total_net_worth = self.balance + stock_value
         
-        # Bankruptcy penalty override
-        if bankrupt:
-            reward = -10.0
+        # 6. Reward (DSR on Total Portfolio)
+        reward = self._calculate_dsr(total_net_worth, self.prev_net_worth)
+        # Scale reward for stability
+        reward *= 10.0 
         
-        # Update previous net worth for next step
-        self.prev_net_worth = current_val
-
-        # 7. Get New Observation
-        obs = self._next_observation()
-        info = {"net_worth": current_val}
-
-        return obs, reward, terminated, False, info
-
-    def _take_action(self, action, current_price):
-        action_type = action
+        self.prev_net_worth = total_net_worth
         
-        # 1 = BUY
-        if action_type == 1: 
-            # Aggressive: Bet 90% of available cash
-            # This fixes the "Cash Drag" where the agent only buys 1 share
-            total_possible = self.balance
-            shares_to_buy = total_possible // current_price
+        # Bankruptcy Check
+        terminated = total_net_worth <= 0
+        if terminated: reward = -10.0
+
+        return self._next_observation(), reward, terminated, False, {"net_worth": total_net_worth}
+
+    def _take_action(self, actions, current_prices):
+        # actions is a vector of 100 floats (-1 to 1)
+        
+        # --- PHASE 1: SELLING ---
+        # We process sells first to generate cash for buys
+        sell_indices = np.where(actions < 0)[0]
+        
+        for idx in sell_indices:
+            # action -0.5 means "Sell 50% of my position in this stock"
+            sell_fraction = abs(actions[idx]) 
+            shares_to_sell = self.shares_held[idx] * sell_fraction
             
-            if shares_to_buy > 0:
-                self.balance -= shares_to_buy * current_price
-                self.shares_held += shares_to_buy
-        
-        # 2 = SELL
-        elif action_type == 2: 
-            # Sell Everything (Exit Position)
-            if self.shares_held > 0:
-                self.balance += self.shares_held * current_price
-                self.shares_held = 0
-        
-        # 0 = HOLD (Do nothing)
+            # Update state
+            self.shares_held[idx] -= shares_to_sell
+            self.balance += shares_to_sell * current_prices[idx]
 
-    def _next_observation(self):
-        # Safety check to prevent index crash
-        if self.current_step >= len(self.df):
-            return np.zeros(8, dtype=np.float32)
-
-        frame = self.df.iloc[self.current_step]
+        # --- PHASE 2: BUYING ---
+        buy_indices = np.where(actions > 0)[0]
         
-        obs = np.array([
-            frame['Open'], frame['High'], frame['Low'], frame['Close'],
-            frame['RSI'], frame['MACD'],
-            self.balance, self.shares_held
-        ], dtype=np.float32)
-        
-        return obs
-
-    def _calculate_dsr(self, current_val, prev_val):
-        """Calculates Differential Sharpe Ratio"""
-        if prev_val == 0: return 0
-        
-        # Log Returns for stability
-        try:
-            R_t = np.log(current_val / prev_val)
-        except ValueError:
-            return -1 # Handle negative/zero values gracefully
-
-        delta_A = R_t - self.A
-        delta_B = (R_t ** 2) - self.B
-        
-        # Store old values for gradient calculation
-        prev_A = self.A
-        prev_B = self.B
-        
-        # Update Moving Averages
-        self.A += self.eta * delta_A
-        self.B += self.eta * delta_B
-        
-        # DSR Calculation
-        variance = prev_B - (prev_A ** 2)
-        
-        # Stability: If variance is near zero, return 0 to avoid explosion
-        if variance < 1e-6:
-            return 0.0
+        if len(buy_indices) > 0:
+            buy_weights = actions[buy_indices]
             
-        numerator = prev_B * delta_A - 0.5 * prev_A * delta_B
-        denominator = variance ** 1.5
-        
-        D_t = numerator / denominator
-        
-        # Clip reward to keep PPO stable (-5 to +5)
-        return np.clip(D_t, -5, 5)
+            # Softmax-style Normalization
+            # If agent wants to buy Stock A (1.0) and Stock B (1.0), 
+            # we can't spend 200% of cash. We split 50/50.
+            total_weight = np.sum(buy_weights)
+            
+            # If total desire > 1, normalize to 1. 
+            # If total desire is 0.5, we only spend 50% of cash (hold the rest).
+            scale = 1.0
+            if total_weight > 1.0:
+                scale = 1.0 / total_weight
+                
+            # Execute Buys
+            for idx, weight in zip(buy_indices, buy_weights):
+                allocation_amt = self.balance * (weight * scale)
+                
+                # Transaction: floor division to get whole shares
+                if current_prices[idx] > 0:
+                    shares = allocation_amt // current_prices[idx]
+                    
+                    self.shares_held[idx] += shares
+                    self.balance -= shares * current_prices[idx]
