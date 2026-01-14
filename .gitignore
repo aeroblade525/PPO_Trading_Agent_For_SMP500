@@ -6,3 +6,4 @@ clean.py
 *.png
 *.sqlite
 __pychache__
+*.sqlite-journal
