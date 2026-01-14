@@ -8,4 +8,3 @@ lxml
 fastparquet
 torch
 numpy
-sqlite
