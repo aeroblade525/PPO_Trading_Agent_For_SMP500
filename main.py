@@ -3,35 +3,53 @@ import pandas as pd
 import gymnasium as gym
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
-
+import yfinance as yf
 # --- Imports from your project structure ---
 from src.env.environment import SP500TradingEnv  # Corrected import name
 from src.ppo.PPO_Classes import Agent
 from src.ppo.utils import plot_learning_curve
 
 # --- 1. Helper: Synthetic Data Generator ---
-def make_test_df(n=300, seed=42, start_price=400.0):
-    rng = np.random.default_rng(seed)
-    
-    # Synthetic random walk
-    rets = rng.normal(loc=0.0002, scale=0.01, size=n)
-    close = start_price * np.exp(np.cumsum(rets))
-    
-    # Create plausible OHLC
-    open_ = close * (1 + rng.normal(0, 0.002, size=n))
-    high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.003, size=n)))
-    low  = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.003, size=n)))
-    
-    df = pd.DataFrame({
-        "Open": open_, "High": high, "Low": low, "Close": close,
-    })
-    
-    # Add Indicators
-    df["RSI"] = RSIIndicator(close=df["Close"], window=14).rsi()
-    df["MACD"] = MACD(close=df["Close"], window_slow=26, window_fast=12).macd()
-    
-    # Drop NaNs
-    df = df.dropna().reset_index(drop=True)
+def make_test_df(ticker):
+    # 1) Download AAPL daily data for the past 2 years
+    df = yf.download(
+        "TSLA",
+        period="2y",
+        interval="1d",
+        auto_adjust=False,
+        progress=False
+    )
+
+    # yfinance returns DatetimeIndex; keep it if you want, but env doesn't require it
+    df = df.reset_index()
+
+    # 2) Standardize column names (sometimes yfinance provides MultiIndex columns)
+    # If you get a MultiIndex like ('Open','AAPL'), flatten it.
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
+    # 3) Ensure required OHLC columns exist
+    required = ["Open", "High", "Low", "Close"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns from yfinance: {missing}. Got: {df.columns.tolist()}")
+
+    # 4) Compute indicators required by your env: RSI and MACD (based on Close)
+    close = df["Close"].astype(float)
+
+    df["RSI"] = RSIIndicator(close=close, window=14).rsi()
+    df["MACD"] = MACD(close=close, window_slow=26, window_fast=12, window_sign=9).macd()
+
+    # 5) Drop indicator warmup NaNs and reset index
+    df = df.dropna(subset=["RSI", "MACD"]).reset_index(drop=True)
+
+    # 6) Keep only what the env needs (optional, but clean)
+    df = df[["Open", "High", "Low", "Close", "RSI", "MACD"]].copy()
+
+    # 7) Enforce numeric dtypes
+    for col in df.columns:
+        df[col] = df[col].astype(np.float32)
+
     return df
 
 # --- 2. Helper: simple Normalization Wrapper ---
@@ -59,78 +77,82 @@ class SimpleNormalizeWrapper(gym.Wrapper):
         return self.normalize(obs), reward, terminated, truncated, info
 
 # --- 3. Main Training Loop ---
-if __name__ == "__main__":
-    # 1. Create Data and Environment
-    df = make_test_df(n=500)
-    raw_env = SP500TradingEnv(df=df)
-    
-    # 2. Wrap environment to normalize inputs (CRITICAL FOR PPO)
-    env = SimpleNormalizeWrapper(raw_env)
+# 1. Create Data and Environment
+df = make_test_df("TSLA")
+raw_env = SP500TradingEnv(df=df)
 
-    # 3. Hyperparameters
-    N = 20
-    batch_size = 5
-    n_epochs = 4
-    alpha = 0.0003
-    n_games = 300
-    
-    agent = Agent(
-        n_actions=env.action_space.n,
-        batch_size=batch_size,
-        alpha=alpha,
-        n_epochs=n_epochs,
-        input_dims=env.observation_space.shape,
-    )
+# 2. Wrap environment to normalize inputs (CRITICAL FOR PPO)
+env = SimpleNormalizeWrapper(raw_env)
 
-    figure_file = "trading_agent_learning_curve.png"
-    best_score = -np.inf
-    score_history = []
-    
-    learn_iters = 0
-    avg_score = 0.0
-    n_steps = 0
+# 3. Hyperparameters
+N = 200
+batch_size = 10
+n_epochs = 4
+alpha = 0.0003
+n_games = 1500
 
-    print("Starting training...")
+agent = Agent(
+    n_actions=env.action_space.n,
+    batch_size=batch_size,
+    alpha=alpha,
+    n_epochs=n_epochs,
+    input_dims=env.observation_space.shape,
+)
 
-    for i in range(n_games):
-        observation, info = env.reset()
-        terminated = False
-        truncated = False
-        score = 0.0
+figure_file = "trading_agent_learning_curve.png"
+figure_file2 = "trading_agent_balance.png"
+best_score = -np.inf
+score_history = []
+price_history = []
+learn_iters = 0
+avg_score = 0.0
+n_steps = 0
 
-        while not (terminated or truncated):
-            # FIX: Ensure proper shape/type for custom agents
-            action, prob, val = agent.choose_action(observation)
-            
-            # FIX: Convert Tensor/Array action to standard Python Int for the Env
-            if hasattr(action, 'item'):
-                action_env = action.item() 
-            else:
-                action_env = action
+print("Starting training...")
 
-            observation_, reward, terminated, truncated, info = env.step(action_env)
-            
-            n_steps += 1
-            score += reward
-            
-            done_flag = terminated or truncated
-            agent.remember(observation, action, prob, val, reward, done_flag)
+for i in range(n_games):
+    observation, info = env.reset()
+    terminated = False
+    truncated = False
+    score = 0.0
 
-            if n_steps % N == 0:
-                agent.learn()
-                learn_iters += 1
+    while not (terminated or truncated):
+        # FIX: Ensure proper shape/type for custom agents
+        action, prob, val = agent.choose_action(observation)
 
-            observation = observation_
+        # FIX: Convert Tensor/Array action to standard Python Int for the Env
+        if hasattr(action, 'item'):
+            action_env = action.item()
+        else:
+            action_env = action
 
-        score_history.append(score)
-        avg_score = np.mean(score_history[-100:])
+        observation_, reward, terminated, truncated, info = env.step(action_env)
+        info = info['net_worth']
+        n_steps += 1
+        score += reward
 
-        if avg_score > best_score:
-            best_score = avg_score
-            agent.save_models()
+        done_flag = terminated or truncated
+        agent.remember(observation, action, prob, val, reward, done_flag)
 
-        print(f"Episode {i} | Score: {score:.2f} | Avg Score: {avg_score:.2f} | Steps: {n_steps}")
+        if n_steps % N == 0:
+            agent.learn()
+            learn_iters += 1
 
-    # Plotting
-    x = [i + 1 for i in range(len(score_history))]
-    plot_learning_curve(x, score_history, figure_file)
+        observation = observation_
+
+    score_history.append(score)
+    price_history.append(info)
+    avg_price = np.mean(price_history[-100:])
+    avg_score = np.mean(score_history[-100:])
+
+    if avg_score > best_score:
+        best_score = avg_score
+        agent.save_models()
+
+    print(
+        f"Episode {i} | Score: {score:.2f} | Avg Score: {avg_score:.2f} | Steps: {n_steps} | Balance: {info} |Avg Balance {avg_price}")
+
+# Plotting
+x = [i + 1 for i in range(len(score_history))]
+plot_learning_curve(x, score_history, figure_file)
+plot_learning_curve(x, price_history, figure_file2)
