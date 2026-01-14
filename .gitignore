@@ -4,3 +4,4 @@ todo.txt
 *.idea
 clean.py
 *.png
+*.sqlite
