@@ -132,3 +132,14 @@ class MultiStockTradingEnv(gym.Env):
                     
                     self.shares_held[idx] += shares
                     self.balance -= shares * current_prices[idx]
+
+    def _next_observation(self):
+        market_data = self.data[self.current_step].flatten()
+
+        obs = np.concatenate([
+            market_data,
+            self.shares_held,
+            [self.balance]
+        ])
+
+        return obs.astype(np.float32)
