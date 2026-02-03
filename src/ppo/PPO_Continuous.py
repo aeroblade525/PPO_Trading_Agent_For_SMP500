@@ -4,12 +4,6 @@ import random
 import time
 from dataclasses import dataclass
 from typing import Optional
-
-import pandas as pd
-from ta.momentum import RSIIndicator
-from ta.trend import MACD
-import yfinance as yf
-
 import gymnasium as gym
 import numpy as np
 import torch
