@@ -4,18 +4,27 @@ import gymnasium as gym
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 import yfinance as yf
+import time
+import torch as T
 # --- Imports from your project structure ---
 from src.env.environment import SP500TradingEnv  # Corrected import name
 from src.ppo.PPO_Classes import Agent
 from src.ppo.utils import plot_learning_curve
 
+print(f"CUDA Available: {T.cuda.is_available()}")
+print(f"PyTorch Version: {T.__version__}")
+print(f"CUDA Version in PyTorch: {T.version.cuda}")
+
+T.set_float32_matmul_precision('high')
+
+
 # --- 1. Helper: Synthetic Data Generator ---
 def make_test_df(ticker):
-    # 1) Download AAPL daily data for the past 2 years
+    # 1) Download daily data for the past 2 years
     df = yf.download(
         ticker,
-        period="2y",
-        interval="1d",
+        period="730d",  # 2 years of data
+        interval="1h",  # DAILY data for faster training (not hourly)
         auto_adjust=False,
         progress=False
     )
@@ -37,8 +46,8 @@ def make_test_df(ticker):
     # 4) Compute indicators required by your env: RSI and MACD (based on Close)
     close = df["Close"].astype(float)
 
-    df["RSI"] = RSIIndicator(close=close, window=14).rsi()
-    df["MACD"] = MACD(close=close, window_slow=26, window_fast=12, window_sign=9).macd()
+    df["RSI"] = RSIIndicator(close=close, window=14 * 6).rsi()
+    df["MACD"] = MACD(close=close, window_slow=26 * 6, window_fast=12 * 6, window_sign=9 * 6).macd()
 
     # 5) Drop indicator warmup NaNs and reset index
     df = df.dropna(subset=["RSI", "MACD"]).reset_index(drop=True)
@@ -52,22 +61,23 @@ def make_test_df(ticker):
 
     return df
 
+
 # --- 2. Helper: simple Normalization Wrapper ---
 # PPO fails if inputs are 400.0 and 0.001 mixed together.
 class SimpleNormalizeWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        
+
     def normalize(self, obs):
         # A simple manual scaling strategy
         # [Open, High, Low, Close, RSI, MACD, Balance, Shares]
-        # We scale prices by 1000, RSI by 100, Balance by 10000
+        # We scale prices by 1000, RSI by 100, Balance by initial_balance scale
         obs = np.array(obs, dtype=np.float32)
         obs[0:4] /= 1000.0  # Scale Prices
-        obs[4] /= 100.0     # Scale RSI
-        obs[5] /= 20.0      # Scale MACD (Approx range -20 to 20 for high priced stocks)
-        obs[6] /= 10000.0   # Scale Balance
-        obs[7] /= 100.0     # Scale Shares (Assuming max shares < 100 for start)
+        obs[4] /= 100.0  # Scale RSI
+        obs[5] /= 20.0  # Scale MACD (Approx range -20 to 20 for high priced stocks)
+        obs[6] /= 100000.0  # Scale Balance (matches initial balance order of magnitude)
+        obs[7] /= 1000.0  # Scale Shares (Allow for higher share counts)
         return obs
 
     def reset(self, **kwargs):
@@ -78,83 +88,92 @@ class SimpleNormalizeWrapper(gym.Wrapper):
         obs, reward, terminated, truncated, info = self.env.step(action)
         return self.normalize(obs), reward, terminated, truncated, info
 
+
 # --- 3. Main Training Loop ---
-# 1. Create Data and Environment
-df = make_test_df("TSLA")
-raw_env = SP500TradingEnv(df=df)
+if __name__ == "__main__":
+    # 1. Create Data and Environment
+    print("Downloading data...")
+    df = make_test_df("TSLA")
+    print(f"Data loaded: {len(df)} days")
 
-# 2. Wrap environment to normalize inputs (CRITICAL FOR PPO)
-env = SimpleNormalizeWrapper(raw_env)
+    raw_env = SP500TradingEnv(df=df)
 
-# 3. Hyperparameters
-N = 200
-batch_size = 10
-n_epochs = 4
-alpha = 0.0003
-n_games = 1500
+    # 2. Wrap environment to normalize inputs (CRITICAL FOR PPO)
+    env = SimpleNormalizeWrapper(raw_env)
 
-agent = Agent(
-    n_actions=env.action_space.n,
-    batch_size=batch_size,
-    alpha=alpha,
-    n_epochs=n_epochs,
-    input_dims=env.observation_space.shape,
-)
+    # 3. Hyperparameters - OPTIMIZED FOR GPU UTILIZATION
+    N = 64  # Learn every 64 steps (was 200) - more frequent GPU usage
+    batch_size = 64  # Much larger batches (was 10) - better GPU utilization
+    n_epochs = 10  # More training iterations (was 4) - more GPU work per learn()
+    alpha = 0.0003  # Learning rate
+    n_games = 1500  # Total episodes
 
-figure_file = "trading_agent_learning_curve.png"
-figure_file2 = "trading_agent_balance.png"
-best_score = -np.inf
-score_history = []
-price_history = []
-learn_iters = 0
-avg_score = 0.0
-n_steps = 0
+    agent = Agent(
+        n_actions=env.action_space.n,
+        batch_size=batch_size,
+        alpha=alpha,
+        n_epochs=n_epochs,
+        input_dims=env.observation_space.shape,
+    )
 
-print("Starting training...")
+    figure_file = "trading_agent_learning_curve.png"
+    figure_file2 = "trading_agent_balance.png"
+    best_score = -np.inf
+    score_history = []
+    price_history = []
+    learn_iters = 0
+    avg_score = 0.0
+    n_steps = 0
 
-for i in range(n_games):
-    observation, info = env.reset()
-    terminated = False
-    truncated = False
-    score = 0.0
+    print("Starting training...")
+    print(f"Hyperparameters: N={N}, batch_size={batch_size}, n_epochs={n_epochs}, alpha={alpha}")
 
-    while not (terminated or truncated):
-        # FIX: Ensure proper shape/type for custom agents
-        action, prob, val = agent.choose_action(observation)
+    for i in range(n_games):
+        observation, info = env.reset()
+        terminated = False
+        truncated = False
+        score = 0.0
 
-        # FIX: Convert Tensor/Array action to standard Python Int for the Env
-        if hasattr(action, 'item'):
-            action_env = action.item()
-        else:
-            action_env = action
+        while not (terminated or truncated):
+            # Choose action
+            action, prob, val = agent.choose_action(observation)
 
-        observation_, reward, terminated, truncated, info = env.step(action_env)
-        info = info['net_worth']
-        n_steps += 1
-        score += reward
+            # Convert Tensor/Array action to standard Python Int for the Env
+            if hasattr(action, 'item'):
+                action_env = action.item()
+            else:
+                action_env = action
 
-        done_flag = terminated or truncated
-        agent.remember(observation, action, prob, val, reward, done_flag)
+            observation_, reward, terminated, truncated, info = env.step(action_env)
+            net_worth = info['net_worth']
+            n_steps += 1
+            score += reward
 
-        if n_steps % N == 0:
-            agent.learn()
-            learn_iters += 1
+            done_flag = terminated or truncated
+            agent.remember(observation, action, prob, val, reward, done_flag)
 
-        observation = observation_
+            if n_steps % N == 0:
+                agent.learn()
+                learn_iters += 1
 
-    score_history.append(score)
-    price_history.append(info)
-    avg_price = np.mean(price_history[-100:])
-    avg_score = np.mean(score_history[-100:])
+            observation = observation_
 
-    if avg_score > best_score:
-        best_score = avg_score
-        agent.save_models()
+        score_history.append(score)
+        price_history.append(net_worth)
+        avg_price = np.mean(price_history[-100:])
+        avg_score = np.mean(score_history[-100:])
 
-    print(
-        f"Episode {i} | Score: {score:.2f} | Avg Score: {avg_score:.2f} | Steps: {n_steps} | Balance: {info} |Avg Balance {avg_price}")
+        if avg_score > best_score:
+            best_score = avg_score
+            agent.save_models()
 
-# Plotting
-x = [i + 1 for i in range(len(score_history))]
-plot_learning_curve(x, score_history, figure_file)
-plot_learning_curve(x, price_history, figure_file2)
+        print(
+            f"Episode {i} | Score: {score:.2f} | Avg Score: {avg_score:.2f} | "
+            f"Steps: {n_steps} | Balance: {net_worth:.2f} | Avg Balance: {avg_price:.2f}")
+
+    # Plotting
+    print("Generating plots...")
+    x = [i + 1 for i in range(len(score_history))]
+    plot_learning_curve(x, score_history, figure_file)
+    plot_learning_curve(x, price_history, figure_file2)
+    print(f"Training complete! Plots saved to {figure_file} and {figure_file2}")
