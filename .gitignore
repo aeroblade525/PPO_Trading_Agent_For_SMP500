@@ -6,3 +6,4 @@ clean.py
 *.png
 *.sqlite
 __pycache__/
+.antigravity/

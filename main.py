@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import gymnasium as gym
@@ -5,7 +6,7 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD
 import yfinance as yf
 # --- Imports from your project structure ---
-from src.env.environment import SP500TradingEnv  # Corrected import name
+from src.env.environment import MultiStockTradingEnv  # Updated class name
 from src.ppo.PPO_Classes import Agent
 from src.ppo.utils import plot_learning_curve
 
@@ -29,7 +30,7 @@ def make_test_df(ticker):
         df.columns = [c[0] for c in df.columns]
 
     # 3) Ensure required OHLC columns exist
-    required = ["Open", "High", "Low", "Close"]
+    required = ["Open", "High", "Low", "Close", "Volume"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns from yfinance: {missing}. Got: {df.columns.tolist()}")
@@ -44,7 +45,7 @@ def make_test_df(ticker):
     df = df.dropna(subset=["RSI", "MACD"]).reset_index(drop=True)
 
     # 6) Keep only what the env needs (optional, but clean)
-    df = df[["Open", "High", "Low", "Close", "RSI", "MACD"]].copy()
+    df = df[["Open", "High", "Low", "Close", "RSI", "MACD", "Volume"]].copy()
 
     # 7) Enforce numeric dtypes
     for col in df.columns:
@@ -59,15 +60,35 @@ class SimpleNormalizeWrapper(gym.Wrapper):
         super().__init__(env)
         
     def normalize(self, obs):
-        # A simple manual scaling strategy
-        # [Open, High, Low, Close, RSI, MACD, Balance, Shares]
-        # We scale prices by 1000, RSI by 100, Balance by 10000
+        # Observation structure: [Stock0_Data(7)+Shares(1), Stock1..., Balance(1)]
+        # Total per stock = 8
         obs = np.array(obs, dtype=np.float32)
-        obs[0:4] /= 1000.0  # Scale Prices
-        obs[4] /= 100.0     # Scale RSI
-        obs[5] /= 20.0      # Scale MACD (Approx range -20 to 20 for high priced stocks)
-        obs[6] /= 10000.0   # Scale Balance
-        obs[7] /= 100.0     # Scale Shares (Assuming max shares < 100 for start)
+        
+        n_features_plus_shares = 8
+        n_stocks = (len(obs) - 1) // n_features_plus_shares
+        
+        # Normalize stock data
+        for i in range(n_stocks):
+            base = i * n_features_plus_shares
+            
+            # Prices: Open, High, Low, Close (Indices 0-3)
+            obs[base:base+4] /= 1000.0
+            
+            # RSI (Index 4)
+            obs[base+4] /= 100.0
+            
+            # MACD (Index 5)
+            obs[base+5] /= 20.0
+            
+            # Volume (Index 6) - Normalize by something large, e.g., 10M or 100M
+            obs[base+6] /= 1_000_000.0
+            
+            # Shares (Index 7)
+            obs[base+7] /= 100.0
+            
+        # Normalize Balance (Last element)
+        obs[-1] /= 100000.0
+        
         return obs
 
     def reset(self, **kwargs):
@@ -80,26 +101,57 @@ class SimpleNormalizeWrapper(gym.Wrapper):
 
 # --- 3. Main Training Loop ---
 # 1. Create Data and Environment
-df = make_test_df("TSLA")
-raw_env = SP500TradingEnv(df=df)
+mock_data_path = "data/mock_market_data.npy"
+
+if os.path.exists(mock_data_path):
+    print(f"Loading mock data from {mock_data_path}...")
+    data_tensor = np.load(mock_data_path)
+    # data_tensor shape should be (n_timesteps, n_stocks, n_features)
+    n_stocks_loaded = data_tensor.shape[1]
+    print(f"Loaded data for {n_stocks_loaded} stocks, {data_tensor.shape[0]} timesteps.")
+    
+    print(f"Loaded data for {n_stocks_loaded} stocks, {data_tensor.shape[0]} timesteps.")
+    
+    # Switch to DSR for advanced optimization
+    raw_env = MultiStockTradingEnv(data_tensor=data_tensor, n_stocks=n_stocks_loaded, reward_type="dsr")
+else:
+    print("Mock data not found. downloading TSLA data...")
+    df = make_test_df("TSLA")
+    # Expand df dims to match (Time, Stocks, Features) expected by Env
+    # We'll duplicate the single stock data 100 times to simulate 100 stocks for testing
+    # Data: (Time, Features) -> (Time, 1, Features) -> (Time, 100, Features)
+    data_tensor = np.expand_dims(df.values, axis=1) # (Time, 1, 7)
+    data_tensor = np.tile(data_tensor, (1, 100, 1)) # (Time, 100, 7)
+
+    data_tensor = np.tile(data_tensor, (1, 100, 1)) # (Time, 100, 7)
+
+    # Switch to DSR for advanced optimization
+    raw_env = MultiStockTradingEnv(data_tensor=data_tensor, n_stocks=100, reward_type="dsr")
 
 # 2. Wrap environment to normalize inputs (CRITICAL FOR PPO)
 env = SimpleNormalizeWrapper(raw_env)
 
 # 3. Hyperparameters
-N = 200
-batch_size = 10
-n_epochs = 4
+N = 2048
+batch_size = 64
+n_epochs = 10
 alpha = 0.0003
 n_games = 1500
 
 agent = Agent(
-    n_actions=env.action_space.n,
+    n_actions=env.action_space.shape[0], # Use shape[0] for continuous action vector size
     batch_size=batch_size,
     alpha=alpha,
     n_epochs=n_epochs,
     input_dims=env.observation_space.shape,
 )
+
+# Load existing models if they exist (Continual Learning)
+if os.path.exists("actor_torch_ppo.pth") and os.path.exists("critic_torch_ppo.pth"):
+    print("Found existing models, loading...")
+    agent.load_models()
+else:
+    print("No existing models found, starting from scratch.")
 
 figure_file = "trading_agent_learning_curve.png"
 figure_file2 = "trading_agent_balance.png"
@@ -119,14 +171,9 @@ for i in range(n_games):
     score = 0.0
 
     while not (terminated or truncated):
-        # FIX: Ensure proper shape/type for custom agents
         action, prob, val = agent.choose_action(observation)
 
-        # FIX: Convert Tensor/Array action to standard Python Int for the Env
-        if hasattr(action, 'item'):
-            action_env = action.item()
-        else:
-            action_env = action
+        action_env = action # Steps are fully compatible now
 
         observation_, reward, terminated, truncated, info = env.step(action_env)
         info = info['net_worth']

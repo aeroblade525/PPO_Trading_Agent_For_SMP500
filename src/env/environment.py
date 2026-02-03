@@ -5,16 +5,21 @@ import numpy as np
 class MultiStockTradingEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, data_tensor, initial_balance=100000, n_stocks=100):
+    def __init__(self, data_tensor, initial_balance=100000, n_stocks=100, reward_type="simple"):
         super(MultiStockTradingEnv, self).__init__()
         
-        # Data Structure: 
-        # numpy array of shape (n_timesteps, n_stocks, n_features)
-        # Features usually: [Open, High, Low, Close, RSI, MACD]
+        # Features expected: [Open, High, Low, Close, RSI, MACD, Volume]
         self.data = data_tensor
         self.n_stocks = n_stocks
         self.n_features = data_tensor.shape[2]
         self.initial_balance = initial_balance
+        self.reward_type = reward_type # Options: "simple", "dsr"
+        
+        # Windowing (Train on chunks of data rather than the full history every time)
+        self.window_size = 500  # Default to ~2 years of data per episode
+        self.total_timesteps = data_tensor.shape[0]
+        self.start_step = 0
+        self.end_step = self.total_timesteps
         
         # --- ACTION SPACE ---
         # A vector of 100 continuous numbers between -1 and 1
@@ -24,9 +29,10 @@ class MultiStockTradingEnv(gym.Env):
         )
 
         # --- OBSERVATION SPACE ---
-        # We see: (Market Data for 100 stocks) + (Shares Held for 100 stocks) + (Cash Balance)
-        # Size = (100 * 6 features) + (100 share counts) + 1 balance
-        obs_size = (self.n_stocks * self.n_features) + self.n_stocks + 1
+        # Interleaved structure: For each stock, we have (n_features + 1) values:
+        # [Stock1_Feature1, ..., Stock1_FeatureN, Stock1_Shares, Stock2_Feature1, ...] + Balance
+        # Size = (n_stocks * (n_features + 1)) + 1 balance
+        obs_size = (self.n_stocks * (self.n_features + 1)) + 1
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32
         )
@@ -44,9 +50,20 @@ class MultiStockTradingEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        
+        # Pick a random start point for this episode
+        # Ensure we have at least window_size remaining
+        max_start = self.total_timesteps - self.window_size
+        if max_start > 0:
+            self.start_step = np.random.randint(0, max_start)
+        else:
+            self.start_step = 0
+            
+        self.current_step = self.start_step
+        self.end_step = min(self.start_step + self.window_size, self.total_timesteps - 1)
+        
         self.balance = self.initial_balance
         self.shares_held = np.zeros(self.n_stocks, dtype=np.float32)
-        self.current_step = 0
         self.prev_net_worth = self.initial_balance
         self.A = 0.0
         self.B = 0.0
@@ -59,13 +76,15 @@ class MultiStockTradingEnv(gym.Env):
         current_prices = self.data[self.current_step, :, 3] 
         
         # 2. Execute Trades
-        self._take_action(actions, current_prices)
+        action_penalty = self._take_action(actions, current_prices)
         
         # 3. Move Time Forward
         self.current_step += 1
         
         # 4. Check Termination
-        if self.current_step >= len(self.data) - 1:
+        # 4. Check Termination
+        # Terminate if we reach the end of the window OR the end of data
+        if self.current_step >= self.end_step:
             return np.zeros(self.observation_space.shape), 0, True, False, {"net_worth": self.prev_net_worth}
 
         # 5. Calculate Portfolio Value
@@ -76,10 +95,15 @@ class MultiStockTradingEnv(gym.Env):
         stock_value = np.sum(self.shares_held * next_prices)
         total_net_worth = self.balance + stock_value
         
-        # 6. Reward (DSR on Total Portfolio)
-        reward = self._calculate_dsr(total_net_worth, self.prev_net_worth)
-        # Scale reward for stability
-        reward *= 10.0 
+        # 6. Reward Calculation
+        if self.reward_type == "dsr":
+            reward = self._calculate_robust_dsr(total_net_worth, self.prev_net_worth)
+        else:
+            # Default to simple return
+            reward = self._calculate_reward(total_net_worth, self.prev_net_worth)
+        
+        # Apply penalty (already negative)
+        reward += action_penalty 
         
         self.prev_net_worth = total_net_worth
         
@@ -91,55 +115,126 @@ class MultiStockTradingEnv(gym.Env):
 
     def _take_action(self, actions, current_prices):
         # actions is a vector of 100 floats (-1 to 1)
+        action_penalty = 0.0
         
-        # --- PHASE 1: SELLING ---
-        # We process sells first to generate cash for buys
+        # --- PHASE 1: SELLING (Vectorized) ---
+        # Find indices where we want to sell (action < 0)
         sell_indices = np.where(actions < 0)[0]
         
-        for idx in sell_indices:
-            # action -0.5 means "Sell 50% of my position in this stock"
-            sell_fraction = abs(actions[idx]) 
-            shares_to_sell = self.shares_held[idx] * sell_fraction
+        if len(sell_indices) > 0:
+            # Calculate sell fractions: clip(abs(action), 0, 1)
+            sell_fractions = np.clip(np.abs(actions[sell_indices]), 0.0, 1.0)
             
-            # Update state
-            self.shares_held[idx] -= shares_to_sell
-            self.balance += shares_to_sell * current_prices[idx]
+            # Calculate amount to sell
+            shares_held_to_sell = self.shares_held[sell_indices]
+            shares_to_sell = shares_held_to_sell * sell_fractions
+            
+            # Update holdings
+            self.shares_held[sell_indices] -= shares_to_sell
+            
+            # Update balance (revenue)
+            revenue = np.sum(shares_to_sell * current_prices[sell_indices])
+            self.balance += revenue
 
-        # --- PHASE 2: BUYING ---
+        # --- PHASE 2: BUYING (Vectorized) ---
         buy_indices = np.where(actions > 0)[0]
         
         if len(buy_indices) > 0:
             buy_weights = actions[buy_indices]
             
-            # Softmax-style Normalization
-            # If agent wants to buy Stock A (1.0) and Stock B (1.0), 
-            # we can't spend 200% of cash. We split 50/50.
+            # Normalize weights
             total_weight = np.sum(buy_weights)
-            
-            # If total desire > 1, normalize to 1. 
-            # If total desire is 0.5, we only spend 50% of cash (hold the rest).
             scale = 1.0
+            
             if total_weight > 1.0:
+                # Penalty removed to allow agent to focus on returns.
+                # The constraints are enforced by scaling anyway.
+                action_penalty = 0.0
                 scale = 1.0 / total_weight
                 
-            # Execute Buys
-            for idx, weight in zip(buy_indices, buy_weights):
-                allocation_amt = self.balance * (weight * scale)
+            # Allocate cash: balance * (weight * scale)
+            # vector of shape (len(buy_indices),)
+            allocations = self.balance * (buy_weights * scale)
+            
+            # Get prices for buying stocks
+            buy_prices = current_prices[buy_indices]
+            
+            # Avoid division by zero
+            valid_price_mask = buy_prices > 0
+            
+            if np.any(valid_price_mask):
+                valid_allocations = allocations[valid_price_mask]
+                valid_prices = buy_prices[valid_price_mask]
+                valid_indices = buy_indices[valid_price_mask]
                 
-                # Transaction: floor division to get whole shares
-                if current_prices[idx] > 0:
-                    shares = allocation_amt // current_prices[idx]
-                    
-                    self.shares_held[idx] += shares
-                    self.balance -= shares * current_prices[idx]
+                # Calculate whole shares
+                shares_to_buy = np.floor(valid_allocations / valid_prices)
+                
+                # Update state
+                cost = np.sum(shares_to_buy * valid_prices)
+                self.shares_held[valid_indices] += shares_to_buy
+                self.balance -= cost
+        return action_penalty
+
+    def _calculate_reward(self, current_net_worth, prev_net_worth):
+        """
+        Calculate simple percentage return for stable training.
+        """
+        if prev_net_worth == 0:
+            return 0.0
+            
+        # Simple Return
+        pct_change = (current_net_worth - prev_net_worth) / prev_net_worth
+        
+        # Scale up (e.g. 0.01% -> 0.0001 -> 1.0 reward unit?) 
+        # Returns act are roughly +/- 1-5% per day? NO, per step (day) it is usually +/- 0.1% to 2%
+        # If return is 1% (0.01), let's make that reward 1.0
+        return pct_change * 100.0
+
+    def _calculate_robust_dsr(self, current_net_worth, prev_net_worth):
+        """
+        Calculate a ROBUST Differential Sharpe Ratio (DSR).
+        - Prevents division by zero.
+        - Clips output to reasonable range [-5, 5].
+        """
+        # 1. Calculate Return
+        if prev_net_worth == 0: 
+            return 0.0
+        r_t = (current_net_worth - prev_net_worth) / prev_net_worth
+        
+        # 2. Update Running Stats (Exponential Moving Average)
+        self.A = self.A + self.eta * (r_t - self.A)
+        self.B = self.B + self.eta * (r_t**2 - self.B)
+        
+        # 3. Calculate Variance with Safety
+        variance = self.B - self.A**2
+        
+        # 4. Safe DSR Calculation
+        # Add epsilon to denominator to prevent division by zero
+        # Clip variance to be non-negative
+        std_dev = np.sqrt(max(variance, 1e-6))
+        
+        dsr = self.A / std_dev
+        
+        # 5. Output Clipping
+        # Prevent explosions like -20,000. Clamp to typical range [-5, 5]
+        # This gives a strong signal but doesn't break the neural net
+        dsr = np.clip(dsr, -5.0, 5.0)
+        
+        return dsr
 
     def _next_observation(self):
-        market_data = self.data[self.current_step].flatten()
-
-        obs = np.concatenate([
-            market_data,
-            self.shares_held,
-            [self.balance]
-        ])
-
+        # Get current market data for all stocks: shape (n_stocks, n_features)
+        current_market_data = self.data[self.current_step]
+        
+        # Reshape shares_held to (n_stocks, 1) for horizontal stacking
+        shares_reshaped = self.shares_held.reshape(-1, 1)
+        
+        # Combine market data with shares: shape (n_stocks, n_features + 1)
+        # Each row is [Feature1, Feature2, ..., FeatureN, Shares]
+        stock_obs = np.hstack((current_market_data, shares_reshaped))
+        
+        # Flatten and append balance
+        obs = np.concatenate([stock_obs.flatten(), [self.balance]])
+        
         return obs.astype(np.float32)
