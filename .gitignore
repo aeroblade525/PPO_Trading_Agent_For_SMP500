@@ -5,4 +5,5 @@ todo.txt
 clean.py
 *.png
 *.sqlite
-__pychache__
+__pycache__/
+.antigravity/

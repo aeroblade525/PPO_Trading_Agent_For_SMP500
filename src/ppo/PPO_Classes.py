@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
 
-
 class PPOMemory:
     def __init__(self, batch_size):
         self.states = []
@@ -21,7 +20,7 @@ class PPOMemory:
         batch_start = np.arange(0, n_states, self.batch_size)
         indices = np.arange(n_states, dtype=np.int64)
         np.random.shuffle(indices)
-        batches = [indices[i:i + self.batch_size] for i in batch_start]
+        batches = [indices[i:i+self.batch_size] for i in batch_start]
 
         return (np.array(self.states),
                 np.array(self.actions),
@@ -47,27 +46,44 @@ class PPOMemory:
         self.rewards = []
         self.dones = []
 
-
 class ActorNetwork(nn.Module):
     def __init__(self, n_actions, input_dims, alpha,
-                 fc1_dims=512, fc2_dims=512):
+                 fc1_dims=256, fc2_dims=256):
         super(ActorNetwork, self).__init__()
 
         self.checkpoint_file = "actor_torch_ppo.pth"
+        
+        # Policy Network
         self.actor = nn.Sequential(
             nn.Linear(*input_dims, fc1_dims),
             nn.ReLU(),
             nn.Linear(fc1_dims, fc2_dims),
-            nn.ReLU(),
+            nn.ReLU()
+        )
+        
+        # Output mean (mu) and standard deviation (sigma)
+        # mu is bounded between -1 and 1 via Tanh
+        self.mu = nn.Sequential(
             nn.Linear(fc2_dims, n_actions),
-            nn.Softmax(dim=-1))
+            nn.Tanh() 
+        )
+        
+        # We learn the log_std to ensure std is always positive (via exp)
+        # Initialize to a smaller value (e.g. -3.0 -> std ~0.05) to prevent massive initial randomness
+        self.log_std = nn.Parameter(T.ones(1, n_actions) * -3.0)
 
         self.optimizer = optim.Adam(self.parameters(), lr=alpha)
         self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
         self.to(self.device)
 
     def forward(self, state):
-        dist = Categorical(self.actor(state))
+        x = self.actor(state)
+        mu = self.mu(x)
+        
+        # Expand log_std to match batch size
+        std = self.log_std.exp().expand_as(mu)
+        
+        dist = T.distributions.Normal(mu, std)
 
         return dist
 
@@ -77,9 +93,8 @@ class ActorNetwork(nn.Module):
     def load_checkpoint(self):
         self.load_state_dict(T.load(self.checkpoint_file))
 
-
 class CriticNetwork(nn.Module):
-    def __init__(self, input_dims, alpha, fc1_dims=512, fc2_dims=512):
+    def __init__(self, input_dims, alpha, fc1_dims=256, fc2_dims=256):
         super(CriticNetwork, self).__init__()
 
         self.checkpoint_file = "critic_torch_ppo.pth"
@@ -105,7 +120,6 @@ class CriticNetwork(nn.Module):
 
     def load_checkpoint(self):
         self.load_state_dict(T.load(self.checkpoint_file))
-
 
 class Agent:
     def __init__(self, n_actions, input_dims, gamma=0.99, alpha=0.0003, gae_lambda=0.95,
@@ -133,37 +147,40 @@ class Agent:
         self.critic.load_checkpoint()
 
     def choose_action(self, observation):
-        # FIXED: Efficient tensor creation from numpy array
-        state = T.tensor(observation, dtype=T.float).unsqueeze(0).to(self.actor.device)
+        state = T.tensor(np.array([observation]), dtype=T.float).to(self.actor.device)
 
         dist = self.actor(state)
         value = self.critic(state)
         action = dist.sample()
 
-        probs = T.squeeze(dist.log_prob(action)).item()
-        action = T.squeeze(action).item()
+        # For continuous, log_prob returns a vector. We sum it to get log_prob of the "joint" action
+        # if each action dimension is independent.
+        probs = T.squeeze(dist.log_prob(action)).sum(dim=-1).item()
+        
+        # action is already correct shape usually, but let's convert to numpy
+        action_np = action.cpu().detach().numpy()[0] # remove batch dim
         value = T.squeeze(value).item()
 
-        return action, probs, value
+        return action_np, probs, value
 
     def learn(self):
         for _ in range(self.n_epochs):
-            state_arr, action_arr, old_probs_arr, vals_arr, \
-                reward_arr, done_arr, batches = self.memory.generate_batches()
+            state_arr, action_arr, old_probs_arr, vals_arr,\
+            reward_arr, done_arr, batches = self.memory.generate_batches()
 
             values = vals_arr
             advantage = np.zeros(len(reward_arr), dtype=np.float32)
 
-            for t in range(len(reward_arr) - 1):
-                discount = 1
-                a_t = 0
-                for k in range(t, len(reward_arr) - 1):
-                    a_t += discount * (reward_arr[k] + self.gamma * values[k + 1] * (1 - int(done_arr[k])) - values[k])
-                    discount *= self.gamma * self.gae_lambda
-                advantage[t] = a_t
+            # Faster GAE Calculation (O(N) instead of O(N^2))
+            last_advantage = 0
+            for t in reversed(range(len(reward_arr)-1)):
+                delta = reward_arr[t] + self.gamma * values[t+1] * (1-int(done_arr[t])) - values[t]
+                last_advantage = delta + self.gamma * self.gae_lambda * (1-int(done_arr[t])) * last_advantage
+                advantage[t] = last_advantage
+                
             advantage = T.tensor(advantage).to(self.actor.device)
-
             values = T.tensor(values).to(self.actor.device)
+
             for batch in batches:
                 states = T.tensor(state_arr[batch], dtype=T.float).to(self.actor.device)
                 old_probs = T.tensor(old_probs_arr[batch]).to(self.actor.device)
@@ -175,22 +192,41 @@ class Agent:
                 critic_value = T.squeeze(critic_value)
 
                 new_probs = dist.log_prob(actions)
-                prob_ratio = new_probs.exp() / old_probs.exp()
-                weighted_probs = advantage[batch] * prob_ratio
-                weighted_clipped_probs = T.clamp(prob_ratio, 1 - self.policy_clip,
-                                                 1 + self.policy_clip) * advantage[batch]
+                # Sum log probs for multi-dimensional actions
+                new_probs = new_probs.sum(dim=-1)
+                
+                prob_ratio = (new_probs - old_probs).exp()
+                
+                # Normalize advantages for stability
+                batch_advantage = advantage[batch]
+                batch_advantage = (batch_advantage - batch_advantage.mean()) / (batch_advantage.std() + 1e-8)
+
+                weighted_probs = batch_advantage * prob_ratio
+                weighted_clipped_probs = T.clamp(prob_ratio, 1-self.policy_clip,
+                                                 1+self.policy_clip) * batch_advantage
+                
                 actor_loss = -T.min(weighted_probs, weighted_clipped_probs).mean()
 
                 returns = advantage[batch] + values[batch]
-                critic_loss = (returns - critic_value) ** 2
+                critic_loss = (returns - critic_value)**2
                 critic_loss = critic_loss.mean()
-
-                total_loss = actor_loss + 0.5 * critic_loss
+                
+                # Entropy bonus (encourage exploration)
+                # dist.entropy() returns shape (batch, n_actions)
+                entropy_loss = dist.entropy().sum(dim=-1).mean()
+                
+                # Reduced coefficient from 0.01 to 0.001 to prevent "chaos" dominance
+                total_loss = actor_loss + 0.5 * critic_loss - 0.001 * entropy_loss
+                
                 self.actor.optimizer.zero_grad()
                 self.critic.optimizer.zero_grad()
                 total_loss.backward()
+                
+                # Gradient Clipping
+                T.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                T.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                
                 self.actor.optimizer.step()
                 self.critic.optimizer.step()
 
         self.memory.clear_memory()
-
